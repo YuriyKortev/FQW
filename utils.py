@@ -38,6 +38,28 @@ string_to_class = {
 }
 
 
+class_to_rgb = {
+    1 : np.array([223,37,37], dtype='uint8'),
+    2 : np.array([37,223,62], dtype='uint8')
+}
+
+
+def labels_to_rgb(labels):
+    image = np.zeros((labels.shape[0], labels.shape[1], 3), dtype='uint8')
+    for key, val in class_to_rgb.items():
+        image[labels==key]=val
+        
+    return image
+    
+    
+def rgb_to_labels(rgb_image):
+    labels = np.zeros((rgb_image.shape[0], rgb_image.shape[1]))
+    for key, val in class_to_rgb.items():
+        labels[(rgb_image==val).all(-1)]=key
+        
+    return labels
+
+
 def load_label(string_json, input_shape):
     """
     Функция парсит json с ссылками на разметки, загружает разметки, возвращает маску
@@ -51,13 +73,13 @@ def load_label(string_json, input_shape):
     if 'objects' in data:
         objects = data['objects']
 
-    label = np.zeros(shape=(input_shape[0], input_shape[1]), dtype='float32')
+    label = np.zeros(shape=(input_shape[0], input_shape[1]), dtype='uint8')
     for obj in objects:
         mask = get_image_by_url(obj['instanceURI'], input_shape, type='mask')
         if obj['value'] in string_to_class:
             label[mask == 255] = string_to_class[obj['value']]
     return label
-
+    
 
 def get_image_by_url(url, input_shape, type='mask'):
     """
@@ -71,7 +93,7 @@ def get_image_by_url(url, input_shape, type='mask'):
         s = http.read()
         img_array = np.array(bytearray(s), dtype=np.uint8)
         img = cv.imdecode(img_array, cv.IMREAD_GRAYSCALE)
-        if type != 'original':
+        if input_shape:
             inter = cv.INTER_NEAREST if type == 'mask' else cv.INTER_AREA
             img = cv.resize(img, (input_shape[1], input_shape[0]), interpolation=inter)
 
@@ -94,9 +116,31 @@ def load_image(url, input_shape):
     return img
 
 
+def load_image_by_path(path):
+    img = cv.imread(path,0)
+    #img[img == 0] = np.mean(img[img != 0])  # закрашивание черных областей
+    
+    return img
+    
+def preprocess_image(image):
+    img = np.resize(image,(image.shape[0], image.shape[1], 1))
+    img = img.astype('float32')
+    img /= 255.0
+    
+    return img
+    
+
+def load_label_by_path(path):
+    img = cv.imread(path)
+    img = cv.cvtColor(img, cv.COLOR_BGR2RGB)
+    
+    return img
+    
+
+
 class DataGenerator(Sequence):
-    def __init__(self, X, y, batch_size, input_shape, augmentations):
-        self.paths = list(zip(X.to_list(), y.to_list()))
+    def __init__(self, paths, batch_size, input_shape, augmentations):
+        self.paths = paths
         self.batch_size = batch_size
         self.input_shape = input_shape
         self.augment = augmentations
@@ -114,15 +158,17 @@ class DataGenerator(Sequence):
         batch_y = []
 
         for sample in batch:
-            image = load_image(sample[0], self.input_shape)
-            label = load_label(sample[1], self.input_shape)
+            image = load_image_by_path(sample[0])
+            masks = load_label_by_path(sample[1])
             if self.augment:
-                transformed = self.augment(image=image, mask=label)
-                batch_x.append(transformed['image'])
-                batch_y.append(tf.one_hot(transformed['mask'], len(string_to_class) + 1, dtype='float32').numpy())
+                transformed = self.augment(image=image, mask=masks)
+                labels = rgb_to_labels(transformed['mask'])
+                batch_x.append(preprocess_image(transformed['image']))
+                batch_y.append(tf.one_hot(labels, len(string_to_class) + 1, dtype='float32').numpy())
             else:
-                batch_x.append(image)
-                batch_y.append(tf.one_hot(label, len(string_to_class) + 1, dtype='float32').numpy())
+                batch_x.append(preprocess_image(image))
+                labels = rgb_to_labels(masks)
+                batch_y.append(tf.one_hot(labels, len(string_to_class) + 1, dtype='float32').numpy())
         return np.array(batch_x), np.array(batch_y)
 
 
@@ -138,18 +184,20 @@ def genData(path_x, path_y, batch_size, input_shape, augmentations=None):
     """
     paths = list(zip(path_x.to_list(), path_y.to_list()))
 
-    random.seed(666)
+    #random.seed(666)
 
     i = 0
     while True:
         image_batch = []
         mask_batch = []
-        for b in range(batch_size):
+        b=0
+        while b < batch_size:
             if i == len(paths):
                 i = 0
                 random.shuffle(paths)
             sample = paths[i][0]
             label = paths[i][1]
+            b += 1
             i += 1
 
             try:
@@ -158,7 +206,7 @@ def genData(path_x, path_y, batch_size, input_shape, augmentations=None):
             except:
                 # global df
                 # print('Cant load raw: {}'.format(df['Labeled Data'].to_list().index(sample)))
-                b = -1
+                b += -1
                 continue
 
             if augmentations:
@@ -195,11 +243,11 @@ def drawWidth(thresh, image, type='crack'):
             continue
 
         cv.drawContours(image, [contour], -1, (0, 0, 255) if type is 'crack' else (0, 255, 0),
-                        thickness=20)  # рисование границы трещины
+                        thickness=5)  # рисование границы трещины 20
 
         crack = np.zeros(image.shape)  # рисуется по одной трещине на чистом фоне и считается ширина
         cv.drawContours(crack, [contour], -1, 255, thickness=-1)
-
+        
         if type is 'crack':
 
             max_width = 0
@@ -212,9 +260,11 @@ def drawWidth(thresh, image, type='crack'):
                     max_width = len(idxs[0])
                     point = (idxs[0][0], i)
 
-            cv.line(image, point, (point[0] + max_width, point[1]), (0, 239, 250), 20)
+            cv.line(image, point, (point[0] + max_width, point[1]), (0, 239, 250), 5) #20
             text = 'Cracks width: {} mm'.format(np.round(pxl2mm(max_width), 2))
-            text_size = cv.getTextSize(text, cv.FONT_HERSHEY_COMPLEX, 5, 7)[0]
+
+            
+            text_size = cv.getTextSize(text, cv.FONT_HERSHEY_COMPLEX, 2, 3)[0] #5 7
 
             point = (point[0] + int(max_width / 2) - int(text_size[0] / 2), point[1] - 35)
 
@@ -226,7 +276,7 @@ def drawWidth(thresh, image, type='crack'):
             elif point[0] + text_size[0] > image.shape[1]:
                 point = (image.shape[1] - text_size[0], point[1])
 
-            cv.putText(image, text, point, cv.FONT_HERSHEY_COMPLEX, 5, (0, 239, 250), 7)
+            cv.putText(image, text, point, cv.FONT_HERSHEY_COMPLEX, 2, (0, 239, 250), 3) #5 7
 
 
 def softmax_to_onehot(res):
